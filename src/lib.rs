@@ -42,11 +42,6 @@ impl KvStore {
         let command_pos = self.index.get(&key);
 
         if let Some(command_pos) = command_pos {
-            // println!(
-            // "GET - Start at byte {}, going to read {} bytes.",
-            // command_pos.pos, command_pos.len
-            // );
-
             let local_reader = &mut self.log_reader;
 
             local_reader.seek(io::SeekFrom::Start(command_pos.pos))?; // offset reader's cursor to start of the desired command
@@ -54,8 +49,6 @@ impl KvStore {
 
             let mut command = String::new();
             cmd_reader.read_to_string(&mut command)?;
-
-            // println!("GET - About to parse `{}` into json.", command);
 
             if let Command::Set { key: _, value } = serde_json::from_str(&command)? {
                 return Ok(Some(value));
@@ -74,31 +67,16 @@ impl KvStore {
 
         let num_bytes_written_before_write = self.log_writer.num_bytes_written;
 
-        // println!(
-        // "SET - num_bytes_written_before_write: {}",
-        // num_bytes_written_before_write
-        // );
-
         serde_json::to_writer(&mut self.log_writer, &command)?;
         // writeln!(&mut self.log_writer)?;
         self.log_writer.write(b"\n")?;
 
         let num_bytes_written_after_write = self.log_writer.num_bytes_written;
 
-        // println!(
-        // "SET num_bytes_written_after_write: {}",
-        // num_bytes_written_after_write
-        // );
-
         let command_pos = CommandPos {
             pos: num_bytes_written_before_write,
             len: num_bytes_written_after_write - num_bytes_written_before_write,
         };
-
-        // println!(
-        // "SET - INDEX_UPDATE: key {} has pos {} and len {}.",
-        // key, command_pos.pos, command_pos.len
-        // );
 
         self.index.insert(key, command_pos);
 
@@ -132,8 +110,6 @@ impl KvStore {
             .append(true)
             .read(true)
             .open(path.join(format!("kvs.log")))?;
-
-        // println!("LOG FILE: {:?}", path.join(format!("kvs.log")));
 
         let mut index = HashMap::new();
 
