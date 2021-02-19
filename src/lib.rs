@@ -23,7 +23,7 @@ pub struct KvStore {
     log_reader: BufReader<File>,
     index: HashMap<String, CommandPos>,
     num_unnecessary_entries: usize,
-    path: PathBuf,
+    path: PathBuf, // the path it was initially opened with
 }
 
 #[derive(Serialize, Deserialize)]
@@ -52,8 +52,6 @@ impl KvStore {
 
             let mut command = String::new();
             cmd_reader.read_to_string(&mut command)?;
-
-            // println!("GET -- parsing {} into command", command);
 
             if let Command::Set { key: _, value } = serde_json::from_str(&command)? {
                 return Ok(Some(value));
@@ -114,18 +112,14 @@ impl KvStore {
     /// open the KvStore at a given path, and return the KvStore
     pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
         let path: PathBuf = path.into();
-        // println!("OPEN -- computed path");
 
         fs::create_dir_all(&path)?;
-        // println!("OPEN -- created the dir");
 
         let log_file = OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
             .open(path.join(format!("kvs.log")))?;
-
-        // println!("OPEN -- created log_file");
 
         let mut index = HashMap::new();
 
@@ -173,32 +167,24 @@ impl KvStore {
     }
 
     fn compact(&mut self) -> Result<()> {
-        // println!("COMPACT -- got called");
-
         let mut new_log_file = OpenOptions::new()
             .create(true)
             .write(true)
             .open(self.path.join("kvs_temp.log"))?;
 
-        // println!("COMPACT -- created new/temp log file");
-
         for (_, command_pos) in self.index.iter() {
             let local_reader = &mut self.log_reader;
-            // println!("COMPACT -- Created local reader");
 
             local_reader.seek(io::SeekFrom::Start(command_pos.pos))?; // offset reader's cursor to start of the desired command
             let mut cmd_reader = local_reader.take(command_pos.len);
-            // println!("COMPACT -- Seeked to location, and took in some bytes");
 
             let mut command = String::new();
             cmd_reader.read_to_string(&mut command)?;
-            // println!("COMPACT -- read command into string:\n{}", command);
 
             if let command @ Command::Set { key: _, value: _ } = serde_json::from_str(&command)? {
                 // write to temp log file
                 serde_json::to_writer(&mut new_log_file, &command)?;
                 write!(&mut new_log_file, "\n")?;
-            // println!("COMPACT -- Finished writing command to new log file");
             } else {
                 panic!(
                     "When compacting, index did of a key did not point to a SET command in the log"
@@ -208,17 +194,12 @@ impl KvStore {
 
         new_log_file.flush()?;
 
-        // println!("COMPACT -- about to rename the temp log file");
-
         // don't need the old log file now, rename to kvs.log thereby replacing the old log file
         fs::rename(self.path.join("kvs_temp.log"), self.path.join("kvs.log"))?;
-        // println!("COMPACT -- Renamed old log file ");
 
         let mut new_store = Self::open(&self.path)?;
-        // println!("COMPACT -- Calling OPEN on new log file");
 
         std::mem::swap(self, &mut new_store);
-        // println!("COMPACT -- Finished swap between self and new_store. Returning");
 
         Ok(())
     }
