@@ -15,12 +15,15 @@ use std::{
 };
 use std::{fs::File, path::PathBuf};
 
+const COMPACTION_THRESHOLD: f32 = 0.5;
+
 /// holds the key value pairings
 pub struct KvStore {
     log_writer: BufWriterWithPosition<File>,
     log_reader: BufReader<File>,
-    /// index of the thing
-    pub index: HashMap<String, CommandPos>,
+    index: HashMap<String, CommandPos>,
+    num_unnecessary_entries: usize,
+    path: PathBuf,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -50,6 +53,8 @@ impl KvStore {
             let mut command = String::new();
             cmd_reader.read_to_string(&mut command)?;
 
+            // println!("GET -- parsing {} into command", command);
+
             if let Command::Set { key: _, value } = serde_json::from_str(&command)? {
                 return Ok(Some(value));
             }
@@ -60,6 +65,10 @@ impl KvStore {
 
     /// sets a key to the passed in value
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
+        if self.index.contains_key(&key) {
+            self.num_unnecessary_entries += 1;
+        }
+
         let command = Command::Set {
             key: key.clone(),
             value: value.clone(),
@@ -68,7 +77,6 @@ impl KvStore {
         let num_bytes_written_before_write = self.log_writer.num_bytes_written;
 
         serde_json::to_writer(&mut self.log_writer, &command)?;
-        // writeln!(&mut self.log_writer)?;
         self.log_writer.write(b"\n")?;
 
         let num_bytes_written_after_write = self.log_writer.num_bytes_written;
@@ -79,6 +87,10 @@ impl KvStore {
         };
 
         self.index.insert(key, command_pos);
+
+        if self.should_compact() {
+            self.compact()?;
+        }
 
         Ok(())
     }
@@ -102,8 +114,10 @@ impl KvStore {
     /// open the KvStore at a given path, and return the KvStore
     pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
         let path: PathBuf = path.into();
+        // println!("OPEN -- computed path");
 
         fs::create_dir_all(&path)?;
+        // println!("OPEN -- created the dir");
 
         let log_file = OpenOptions::new()
             .create(true)
@@ -111,7 +125,11 @@ impl KvStore {
             .read(true)
             .open(path.join(format!("kvs.log")))?;
 
+        // println!("OPEN -- created log_file");
+
         let mut index = HashMap::new();
+
+        let mut num_unnecessary_entries = 0;
 
         let log_reader = BufReader::new(log_file.try_clone()?);
         let mut bytes_read = 0;
@@ -122,13 +140,19 @@ impl KvStore {
             let cmd_len = line.len() as u64;
 
             match cmd {
-                Command::Set { key, value: _ } => index.insert(
-                    key,
-                    CommandPos {
-                        pos: bytes_read,
-                        len: cmd_len,
-                    },
-                ),
+                Command::Set { key, value: _ } => {
+                    if index.contains_key(&key) {
+                        num_unnecessary_entries += 1;
+                    }
+
+                    index.insert(
+                        key,
+                        CommandPos {
+                            pos: bytes_read,
+                            len: cmd_len,
+                        },
+                    )
+                }
                 Command::Remove { key } => index.remove(&key),
             };
 
@@ -139,7 +163,64 @@ impl KvStore {
             log_writer: BufWriterWithPosition::new(log_file.try_clone()?, bytes_read),
             log_reader: BufReader::new(log_file),
             index,
+            num_unnecessary_entries,
+            path,
         })
+    }
+
+    fn should_compact(&self) -> bool {
+        self.num_unnecessary_entries as f32 / self.index.len() as f32 > COMPACTION_THRESHOLD
+    }
+
+    fn compact(&mut self) -> Result<()> {
+        // println!("COMPACT -- got called");
+
+        let mut new_log_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(self.path.join("kvs_temp.log"))?;
+
+        // println!("COMPACT -- created new/temp log file");
+
+        for (_, command_pos) in self.index.iter() {
+            let local_reader = &mut self.log_reader;
+            // println!("COMPACT -- Created local reader");
+
+            local_reader.seek(io::SeekFrom::Start(command_pos.pos))?; // offset reader's cursor to start of the desired command
+            let mut cmd_reader = local_reader.take(command_pos.len);
+            // println!("COMPACT -- Seeked to location, and took in some bytes");
+
+            let mut command = String::new();
+            cmd_reader.read_to_string(&mut command)?;
+            // println!("COMPACT -- read command into string:\n{}", command);
+
+            if let command @ Command::Set { key: _, value: _ } = serde_json::from_str(&command)? {
+                // write to temp log file
+                serde_json::to_writer(&mut new_log_file, &command)?;
+                write!(&mut new_log_file, "\n")?;
+            // println!("COMPACT -- Finished writing command to new log file");
+            } else {
+                panic!(
+                    "When compacting, index did of a key did not point to a SET command in the log"
+                )
+            }
+        }
+
+        new_log_file.flush()?;
+
+        // println!("COMPACT -- about to rename the temp log file");
+
+        // don't need the old log file now, rename to kvs.log thereby replacing the old log file
+        fs::rename(self.path.join("kvs_temp.log"), self.path.join("kvs.log"))?;
+        // println!("COMPACT -- Renamed old log file ");
+
+        let mut new_store = Self::open(&self.path)?;
+        // println!("COMPACT -- Calling OPEN on new log file");
+
+        std::mem::swap(self, &mut new_store);
+        // println!("COMPACT -- Finished swap between self and new_store. Returning");
+
+        Ok(())
     }
 }
 
