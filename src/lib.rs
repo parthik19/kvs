@@ -1,21 +1,68 @@
 //! This is a crate used to maintain an in memory key value database
 
-#![deny(missing_docs)]
-
+// #![deny(missing_docs)]
 use failure::format_err;
 use serde::{Deserialize, Serialize};
 use serde_json;
-use std::io;
 use std::{
     collections::HashMap,
-    fs,
+    env, fs,
     fs::OpenOptions,
     io::{BufRead, BufReader, BufWriter, Read, Seek, Write},
+    net::TcpStream,
     u64,
 };
 use std::{fs::File, path::PathBuf};
+use std::{
+    io,
+    net::{SocketAddr, TcpListener},
+};
+
+/// Whether command worked successfully
+pub type Result<T> = std::result::Result<T, failure::Error>;
 
 const COMPACTION_THRESHOLD: f32 = 0.5;
+
+#[derive(Debug, Serialize, Deserialize)]
+/// the command the kvs engine will execute
+pub enum Command {
+    /// set a value for a key
+    Set { key: String, value: String },
+
+    /// retrieve a value for a key
+    Get { key: String },
+
+    /// remove a key/value pairing
+    Remove { key: String },
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum ServerResponse {
+    GetResponse(Option<String>),
+    RemoveSuccess,
+    RemoveFailure,
+    SetSuccess,
+    SetFailure,
+}
+
+/// where in the log file the value resides
+#[derive(Debug)]
+pub struct CommandPos {
+    pos: u64, // where the command starts in the file in bytes
+    len: u64, // length of the command in bytes
+}
+
+/// defines the storage interface called by KvsServer
+pub trait KvsEngine {
+    /// gets the value associated with a key
+    fn get(&mut self, key: String) -> Result<Option<String>>;
+
+    /// set a key-value, overriding previous value if present
+    fn set(&mut self, key: String, value: String) -> Result<()>;
+
+    /// removes a key and it's value
+    fn remove(&mut self, key: String) -> Result<()>;
+}
 
 /// holds the key value pairings
 pub struct KvStore {
@@ -26,90 +73,7 @@ pub struct KvStore {
     path: PathBuf, // the path it was initially opened with
 }
 
-#[derive(Serialize, Deserialize)]
-enum Command {
-    Set { key: String, value: String },
-    Remove { key: String },
-}
-
-/// where in the log file the value resides
-#[derive(Debug)]
-pub struct CommandPos {
-    pos: u64, // where the command starts in the file in bytes
-    len: u64, // length of the command in bytes
-}
-
 impl KvStore {
-    /// retrieves the value of a key, if it exists. else None
-    pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        let command_pos = self.index.get(&key);
-
-        if let Some(command_pos) = command_pos {
-            let local_reader = &mut self.log_reader;
-
-            local_reader.seek(io::SeekFrom::Start(command_pos.pos))?; // offset reader's cursor to start of the desired command
-            let mut cmd_reader = local_reader.take(command_pos.len);
-
-            let mut command = String::new();
-            cmd_reader.read_to_string(&mut command)?;
-
-            if let Command::Set { key: _, value } = serde_json::from_str(&command)? {
-                return Ok(Some(value));
-            }
-        }
-
-        Ok(None)
-    }
-
-    /// sets a key to the passed in value
-    pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        if self.index.contains_key(&key) {
-            self.num_unnecessary_entries += 1;
-        }
-
-        let command = Command::Set {
-            key: key.clone(),
-            value: value.clone(),
-        };
-
-        let num_bytes_written_before_write = self.log_writer.num_bytes_written;
-
-        serde_json::to_writer(&mut self.log_writer, &command)?;
-        self.log_writer.write(b"\n")?;
-
-        let num_bytes_written_after_write = self.log_writer.num_bytes_written;
-
-        let command_pos = CommandPos {
-            pos: num_bytes_written_before_write,
-            len: num_bytes_written_after_write - num_bytes_written_before_write,
-        };
-
-        self.index.insert(key, command_pos);
-
-        if self.should_compact() {
-            self.compact()?;
-        }
-
-        Ok(())
-    }
-
-    /// removes key from kv store
-    pub fn remove(&mut self, key: String) -> Result<()> {
-        if self.get(key.clone())?.is_some() {
-            let command = Command::Remove { key: key.clone() };
-            serde_json::to_writer(&mut self.log_writer, &command)?;
-            // writeln!(&mut self.log_writer)?;
-            self.log_writer.write(b"\n")?;
-
-            self.index.remove(&key);
-
-            Ok(())
-        } else {
-            Err(format_err!("Key not found"))
-        }
-    }
-
-    /// open the KvStore at a given path, and return the KvStore
     pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
         let path: PathBuf = path.into();
 
@@ -148,6 +112,7 @@ impl KvStore {
                     )
                 }
                 Command::Remove { key } => index.remove(&key),
+                Command::Get { key: _ } => unreachable!(),
             };
 
             bytes_read += cmd_len + 1; // because of the newline separating commands
@@ -205,8 +170,73 @@ impl KvStore {
     }
 }
 
-/// Whether command worked successfully
-pub type Result<T> = std::result::Result<T, failure::Error>;
+impl KvsEngine for KvStore {
+    fn get(&mut self, key: String) -> Result<Option<String>> {
+        let command_pos = self.index.get(&key);
+
+        if let Some(command_pos) = command_pos {
+            let local_reader = &mut self.log_reader;
+
+            local_reader.seek(io::SeekFrom::Start(command_pos.pos))?; // offset reader's cursor to start of the desired command
+            let mut cmd_reader = local_reader.take(command_pos.len);
+
+            let mut command = String::new();
+            cmd_reader.read_to_string(&mut command)?;
+
+            if let Command::Set { key: _, value } = serde_json::from_str(&command)? {
+                return Ok(Some(value));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn set(&mut self, key: String, value: String) -> Result<()> {
+        if self.index.contains_key(&key) {
+            self.num_unnecessary_entries += 1;
+        }
+
+        let command = Command::Set {
+            key: key.clone(),
+            value: value.clone(),
+        };
+
+        let num_bytes_written_before_write = self.log_writer.num_bytes_written;
+
+        serde_json::to_writer(&mut self.log_writer, &command)?;
+        self.log_writer.write(b"\n")?;
+
+        let num_bytes_written_after_write = self.log_writer.num_bytes_written;
+
+        let command_pos = CommandPos {
+            pos: num_bytes_written_before_write,
+            len: num_bytes_written_after_write - num_bytes_written_before_write,
+        };
+
+        self.index.insert(key, command_pos);
+
+        if self.should_compact() {
+            self.compact()?;
+        }
+
+        Ok(())
+    }
+
+    fn remove(&mut self, key: String) -> Result<()> {
+        if self.get(key.clone())?.is_some() {
+            let command = Command::Remove { key: key.clone() };
+            serde_json::to_writer(&mut self.log_writer, &command)?;
+            // writeln!(&mut self.log_writer)?;
+            self.log_writer.write(b"\n")?;
+
+            self.index.remove(&key);
+
+            Ok(())
+        } else {
+            Err(format_err!("Key not found"))
+        }
+    }
+}
 
 struct BufWriterWithPosition<T>
 where
@@ -251,5 +281,135 @@ where
 
     fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
+    }
+}
+
+// TODO functionality for kvs-client to talk to kvs-server
+pub struct KvsClient {
+    server_addr: SocketAddr,
+}
+
+impl KvsClient {
+    pub fn with_addr(addr: SocketAddr) -> Self {
+        Self { server_addr: addr }
+    }
+
+    pub fn send_command(&self, command: Command) -> Result<Option<String>> {
+        // append newline char because server reads bytes up to a new line per command
+        let command_string = format!("{}\n", serde_json::to_string(&command)?);
+        let command_bytes = command_string.as_bytes();
+
+        let mut tcp_stream = TcpStream::connect(self.server_addr)?;
+
+        tcp_stream.write(command_bytes)?;
+
+        let mut server_response = String::new();
+        tcp_stream.read_to_string(&mut server_response)?;
+
+        let server_response: ServerResponse = serde_json::from_str(&server_response)?;
+
+        match server_response {
+            ServerResponse::GetResponse(x) => Ok(x),
+            ServerResponse::RemoveFailure => Err(format_err!("Key not found")),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// provides functionality to serve responses from server to client
+pub struct KvsServer {
+    listener: Option<TcpListener>,
+    engine: Box<dyn KvsEngine>,
+}
+
+impl KvsServer {
+    /// creates a KvsServer that listens on provided port
+    pub fn with_addr(addr: SocketAddr) -> Result<Self> {
+        Ok(Self {
+            listener: Some(TcpListener::bind(addr)?),
+            engine: Box::new(KvStore::open(env::current_dir()?)?),
+        })
+    }
+
+    /// infinitely listens for incoming requests and executes them
+    pub fn run(mut self) -> Result<()> {
+        let listener = self
+            .listener
+            .take()
+            .expect("KvsServer created without TCP listener!");
+
+        for stream in listener.incoming() {
+            self.handle_client_request(stream?)?;
+        }
+
+        Err(format_err!(
+            "`incoming` loop broke on listener! Not listening on socket anymore."
+        ))
+    }
+
+    // TODO return success message over TCP stream
+    fn handle_client_request(&mut self, mut stream: TcpStream) -> Result<()> {
+        let mut buf_reader = BufReader::new(&mut stream);
+
+        let mut command = String::new(); // TODO initialize enough space for the smallest of get/set commands
+        buf_reader.read_line(&mut command)?;
+
+        let command: Command = serde_json::from_str(&command)?;
+
+        match command {
+            Command::Get { key } => {
+                let result = self.engine.get(key)?;
+
+                let server_response = ServerResponse::GetResponse(result);
+                let server_response = serde_json::to_string(&server_response)?;
+                let server_response = format!("{}\n", server_response);
+
+                stream.write(server_response.as_bytes())?;
+                Ok(())
+            }
+            Command::Set { key, value } => {
+                let server_response = if let Ok(_) = self.engine.set(key, value) {
+                    ServerResponse::SetSuccess
+                } else {
+                    ServerResponse::SetFailure
+                };
+
+                let server_response = serde_json::to_string(&server_response)?;
+                let server_response = format!("{}\n", server_response);
+
+                stream.write(server_response.as_bytes())?;
+                Ok(())
+            }
+            Command::Remove { key } => {
+                let server_response = if let Ok(_) = self.engine.remove(key) {
+                    ServerResponse::RemoveSuccess
+                } else {
+                    ServerResponse::RemoveFailure
+                };
+
+                let server_response = serde_json::to_string(&server_response)?;
+                let server_response = format!("{}\n", server_response);
+
+                stream.write(server_response.as_bytes())?;
+                Ok(())
+            }
+        }
+    }
+}
+
+// sled storage stuff starts here
+struct SledKvsEngine;
+
+impl KvsEngine for SledKvsEngine {
+    fn get(&mut self, _key: String) -> Result<Option<String>> {
+        todo!()
+    }
+
+    fn set(&mut self, _key: String, _value: String) -> Result<()> {
+        todo!()
+    }
+
+    fn remove(&mut self, _key: String) -> Result<()> {
+        todo!()
     }
 }
