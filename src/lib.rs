@@ -4,6 +4,9 @@
 use failure::format_err;
 use serde::{Deserialize, Serialize};
 use serde_json;
+use sled;
+
+use std::str::FromStr;
 use std::{
     collections::HashMap,
     env, fs,
@@ -324,11 +327,55 @@ pub struct KvsServer {
 
 impl KvsServer {
     /// creates a KvsServer that listens on provided port
-    pub fn with_addr(addr: SocketAddr) -> Result<Self> {
+    pub fn new(addr: SocketAddr, engine: &Option<EngineType>) -> Result<Self> {
+        let existing_engine = Self::existing_engine()?;
+        let engine = match (&engine, &existing_engine) {
+            (None, _) => Self::load_existing_or_default_engine(existing_engine)?,
+            (Some(EngineType::Kvs), Some(EngineType::Kvs)) => {
+                Box::new(KvStore::open(env::current_dir()?)?)
+            }
+            (Some(EngineType::Sled), Some(EngineType::Sled)) => {
+                Box::new(SledKvsEngine::open(env::current_dir()?)?)
+            }
+            (Some(EngineType::Kvs), None) => Box::new(KvStore::open(env::current_dir()?)?),
+            (Some(EngineType::Sled), None) => Box::new(SledKvsEngine::open(env::current_dir()?)?),
+            _ => {
+                return Err(format_err!(
+                    "Incompatible engine specified: user: {:?}, existing: {:?}",
+                    engine,
+                    existing_engine
+                ))
+            }
+        };
+
         Ok(Self {
             listener: Some(TcpListener::bind(addr)?),
-            engine: Box::new(KvStore::open(env::current_dir()?)?),
+            engine,
         })
+    }
+
+    fn load_existing_or_default_engine(
+        existing_engine: Option<EngineType>,
+    ) -> Result<Box<dyn KvsEngine>> {
+        match existing_engine {
+            None | Some(EngineType::Kvs) => Ok(Box::new(KvStore::open(env::current_dir()?)?)),
+            Some(EngineType::Sled) => Ok(Box::new(SledKvsEngine::open(env::current_dir()?)?)),
+        }
+    }
+
+    fn existing_engine() -> Result<Option<EngineType>> {
+        for entry in fs::read_dir(env::current_dir()?)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.ends_with("kvs.log") {
+                return Ok(Some(EngineType::Kvs));
+            } else if path.ends_with("sled_db.log") {
+                return Ok(Some(EngineType::Sled));
+            }
+        }
+
+        eprintln!("Didn't find any log files when searching for existing engine");
+        Ok(None)
     }
 
     /// infinitely listens for incoming requests and executes them
@@ -398,18 +445,68 @@ impl KvsServer {
 }
 
 // sled storage stuff starts here
-struct SledKvsEngine;
+struct SledKvsEngine {
+    inner: sled::Db,
+}
+
+impl SledKvsEngine {
+    fn open(path: PathBuf) -> Result<SledKvsEngine> {
+        Ok(Self {
+            inner: sled::open(path.join("sled_db.log"))?,
+        })
+    }
+}
 
 impl KvsEngine for SledKvsEngine {
-    fn get(&mut self, _key: String) -> Result<Option<String>> {
-        todo!()
+    fn get(&mut self, key: String) -> Result<Option<String>> {
+        Ok(self
+            .inner
+            .get(key)?
+            .map(|i_vec| AsRef::<[u8]>::as_ref(&i_vec).to_vec())
+            .map(String::from_utf8)
+            .transpose()?)
     }
 
-    fn set(&mut self, _key: String, _value: String) -> Result<()> {
-        todo!()
+    fn set(&mut self, key: String, value: String) -> Result<()> {
+        self.inner.insert(key, value.into_bytes()).map(|_| ())?;
+        self.inner.flush()?;
+        Ok(())
     }
 
-    fn remove(&mut self, _key: String) -> Result<()> {
-        todo!()
+    fn remove(&mut self, key: String) -> Result<()> {
+        let result = self.inner.remove(key)?;
+        self.inner.flush()?;
+
+        if let Some(_) = result {
+            Ok(())
+        } else {
+            Err(format_err!("Removing non existent key"))
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum EngineType {
+    Kvs,
+    Sled,
+}
+
+impl ToString for EngineType {
+    fn to_string(&self) -> String {
+        match self {
+            Self::Kvs => String::from("kvs"),
+            Self::Sled => String::from("sled"),
+        }
+    }
+}
+
+impl FromStr for EngineType {
+    type Err = failure::Error;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "kvs" => Ok(Self::Kvs),
+            "sled" => Ok(Self::Sled),
+            _ => Err(format_err!("invalid engine type")),
+        }
     }
 }

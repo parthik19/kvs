@@ -1,4 +1,4 @@
-use kvs::{KvsServer, Result};
+use kvs::{EngineType, KvsServer, Result};
 use log::info;
 use simplelog::{Config, LevelFilter, TermLogger, TerminalMode};
 use std::net::SocketAddr;
@@ -10,7 +10,7 @@ struct KvsServerCommand {
     addr: SocketAddr,
 
     #[structopt(long = "engine")]
-    engine: String,
+    engine: Option<EngineType>,
 }
 
 fn main() -> Result<()> {
@@ -18,13 +18,14 @@ fn main() -> Result<()> {
 
     let server_command = KvsServerCommand::from_args();
 
+    let kvs_server = KvsServer::new(server_command.addr, &server_command.engine)?;
+
     info!("version: {}", env!("CARGO_PKG_VERSION"));
     info!(
-        "{} running on {}",
-        server_command.engine, server_command.addr
+        "Engine {:?} running on {:?}",
+        server_command.engine.unwrap_or(EngineType::Kvs).to_string(),
+        server_command.addr
     );
-
-    let kvs_server = KvsServer::with_addr(server_command.addr)?;
 
     kvs_server.run()
 }
