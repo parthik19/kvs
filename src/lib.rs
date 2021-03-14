@@ -4,32 +4,66 @@
 
 use failure::format_err;
 use serde::{Deserialize, Serialize};
-use serde_json;
-use std::io;
+use std::net::{SocketAddr, TcpListener};
+use std::str::FromStr;
 use std::{
-    collections::HashMap,
-    fs,
-    fs::OpenOptions,
-    io::{BufRead, BufReader, BufWriter, Read, Seek, Write},
+    env, fs,
+    io::{BufRead, BufReader, Read, Write},
+    net::TcpStream,
     u64,
 };
-use std::{fs::File, path::PathBuf};
+
+mod engines;
+
+pub use engines::kvs::KvStore;
+pub use engines::sled::SledKvsEngine;
+
+/// Whether command worked successfully
+pub type Result<T> = std::result::Result<T, failure::Error>;
 
 const COMPACTION_THRESHOLD: f32 = 0.5;
 
-/// holds the key value pairings
-pub struct KvStore {
-    log_writer: BufWriterWithPosition<File>,
-    log_reader: BufReader<File>,
-    index: HashMap<String, CommandPos>,
-    num_unnecessary_entries: usize,
-    path: PathBuf, // the path it was initially opened with
+#[derive(Debug, Serialize, Deserialize)]
+/// the command the kvs engine will execute
+pub enum Command {
+    /// set a value for a key
+    Set {
+        /// key of KV pair to insert
+        key: String,
+        /// value of KV pair to insert
+        value: String,
+    },
+
+    /// retrieve a value for a key
+    Get {
+        /// want value of this key
+        key: String,
+    },
+
+    /// remove a key/value pairing
+    Remove {
+        /// remove KV pair of this key
+        key: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
-enum Command {
-    Set { key: String, value: String },
-    Remove { key: String },
+/// the response sent back from server to client
+pub enum ServerResponse {
+    /// get response
+    GetResponse(Option<String>),
+
+    /// returned when removal of a key was successful
+    RemoveSuccess,
+
+    /// returned when removal of a key was a failure
+    RemoveFailure,
+
+    /// returned when setting a KV pair was successful
+    SetSuccess,
+
+    /// returned when setting a KV pair was a failure
+    SetFailure,
 }
 
 /// where in the log file the value resides
@@ -39,217 +73,210 @@ pub struct CommandPos {
     len: u64, // length of the command in bytes
 }
 
-impl KvStore {
-    /// retrieves the value of a key, if it exists. else None
-    pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        let command_pos = self.index.get(&key);
+/// defines the storage interface called by KvsServer
+pub trait KvsEngine {
+    /// gets the value associated with a key
+    fn get(&mut self, key: String) -> Result<Option<String>>;
 
-        if let Some(command_pos) = command_pos {
-            let local_reader = &mut self.log_reader;
+    /// set a key-value, overriding previous value if present
+    fn set(&mut self, key: String, value: String) -> Result<()>;
 
-            local_reader.seek(io::SeekFrom::Start(command_pos.pos))?; // offset reader's cursor to start of the desired command
-            let mut cmd_reader = local_reader.take(command_pos.len);
+    /// removes a key and it's value
+    fn remove(&mut self, key: String) -> Result<()>;
+}
 
-            let mut command = String::new();
-            cmd_reader.read_to_string(&mut command)?;
+/// this struct exposes the interface for interacting with the KVS server
+pub struct KvsClient {
+    server_addr: SocketAddr,
+}
 
-            if let Command::Set { key: _, value } = serde_json::from_str(&command)? {
-                return Ok(Some(value));
+impl KvsClient {
+    /// create a KvsClient that listens to the specified port
+    pub fn with_addr(addr: SocketAddr) -> Self {
+        Self { server_addr: addr }
+    }
+
+    /// sends specified command to server
+    pub fn send_command(&self, command: Command) -> Result<Option<String>> {
+        // append newline char because server reads bytes up to a new line per command
+        let command_string = format!("{}\n", serde_json::to_string(&command)?);
+        let command_bytes = command_string.as_bytes();
+
+        let mut tcp_stream = TcpStream::connect(self.server_addr)?;
+
+        tcp_stream.write_all(command_bytes)?;
+
+        let mut server_response = String::new();
+        tcp_stream.read_to_string(&mut server_response)?;
+
+        let server_response: ServerResponse = serde_json::from_str(&server_response)?;
+
+        match server_response {
+            ServerResponse::GetResponse(x) => Ok(x),
+            ServerResponse::RemoveFailure => Err(format_err!("Key not found")),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// provides functionality to serve responses from server to client
+pub struct KvsServer {
+    listener: Option<TcpListener>,
+    engine: Box<dyn KvsEngine>,
+}
+
+impl KvsServer {
+    /// creates a KvsServer that listens on provided port
+    pub fn new(addr: SocketAddr, engine: &Option<EngineType>) -> Result<Self> {
+        let existing_engine = Self::existing_engine()?;
+        let engine = match (&engine, &existing_engine) {
+            (None, _) => Self::load_existing_or_default_engine(existing_engine)?,
+            (Some(EngineType::Kvs), Some(EngineType::Kvs)) => {
+                Box::new(engines::kvs::KvStore::open(env::current_dir()?)?)
+            }
+            (Some(EngineType::Sled), Some(EngineType::Sled)) => {
+                Box::new(engines::sled::SledKvsEngine::open(env::current_dir()?)?)
+            }
+            (Some(EngineType::Kvs), None) => {
+                Box::new(engines::kvs::KvStore::open(env::current_dir()?)?)
+            }
+            (Some(EngineType::Sled), None) => {
+                Box::new(engines::sled::SledKvsEngine::open(env::current_dir()?)?)
+            }
+            _ => {
+                return Err(format_err!(
+                    "Incompatible engine specified: user: {:?}, existing: {:?}",
+                    engine,
+                    existing_engine
+                ))
+            }
+        };
+
+        Ok(Self {
+            listener: Some(TcpListener::bind(addr)?),
+            engine,
+        })
+    }
+
+    fn load_existing_or_default_engine(
+        existing_engine: Option<EngineType>,
+    ) -> Result<Box<dyn KvsEngine>> {
+        match existing_engine {
+            None | Some(EngineType::Kvs) => {
+                Ok(Box::new(engines::kvs::KvStore::open(env::current_dir()?)?))
+            }
+            Some(EngineType::Sled) => Ok(Box::new(engines::sled::SledKvsEngine::open(
+                env::current_dir()?,
+            )?)),
+        }
+    }
+
+    fn existing_engine() -> Result<Option<EngineType>> {
+        for entry in fs::read_dir(env::current_dir()?)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.ends_with("kvs.log") {
+                return Ok(Some(EngineType::Kvs));
+            } else if path.ends_with("sled_db.log") {
+                return Ok(Some(EngineType::Sled));
             }
         }
 
         Ok(None)
     }
 
-    /// sets a key to the passed in value
-    pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        if self.index.contains_key(&key) {
-            self.num_unnecessary_entries += 1;
+    /// infinitely listens for incoming requests and executes them
+    pub fn run(mut self) -> Result<()> {
+        let listener = self
+            .listener
+            .take()
+            .expect("KvsServer created without TCP listener!");
+
+        for stream in listener.incoming() {
+            self.handle_client_request(stream?)?;
         }
 
-        let command = Command::Set {
-            key: key.clone(),
-            value: value.clone(),
-        };
-
-        let num_bytes_written_before_write = self.log_writer.num_bytes_written;
-
-        serde_json::to_writer(&mut self.log_writer, &command)?;
-        self.log_writer.write(b"\n")?;
-
-        let num_bytes_written_after_write = self.log_writer.num_bytes_written;
-
-        let command_pos = CommandPos {
-            pos: num_bytes_written_before_write,
-            len: num_bytes_written_after_write - num_bytes_written_before_write,
-        };
-
-        self.index.insert(key, command_pos);
-
-        if self.should_compact() {
-            self.compact()?;
-        }
-
-        Ok(())
+        Err(format_err!(
+            "`incoming` loop broke on listener! Not listening on socket anymore."
+        ))
     }
 
-    /// removes key from kv store
-    pub fn remove(&mut self, key: String) -> Result<()> {
-        if self.get(key.clone())?.is_some() {
-            let command = Command::Remove { key: key.clone() };
-            serde_json::to_writer(&mut self.log_writer, &command)?;
-            // writeln!(&mut self.log_writer)?;
-            self.log_writer.write(b"\n")?;
+    // TODO return success message over TCP stream
+    fn handle_client_request(&mut self, mut stream: TcpStream) -> Result<()> {
+        let mut buf_reader = BufReader::new(&mut stream);
 
-            self.index.remove(&key);
+        let mut command = String::new(); // TODO initialize enough space for the smallest of get/set commands
+        buf_reader.read_line(&mut command)?;
 
-            Ok(())
-        } else {
-            Err(format_err!("Key not found"))
-        }
-    }
+        let command: Command = serde_json::from_str(&command)?;
 
-    /// open the KvStore at a given path, and return the KvStore
-    pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
-        let path: PathBuf = path.into();
+        match command {
+            Command::Get { key } => {
+                let result = self.engine.get(key)?;
 
-        fs::create_dir_all(&path)?;
+                let server_response = ServerResponse::GetResponse(result);
+                let server_response = serde_json::to_string(&server_response)?;
+                let server_response = format!("{}\n", server_response);
 
-        let log_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(path.join(format!("kvs.log")))?;
+                stream.write_all(server_response.as_bytes())?;
+                Ok(())
+            }
+            Command::Set { key, value } => {
+                let server_response = if self.engine.set(key, value).is_ok() {
+                    ServerResponse::SetSuccess
+                } else {
+                    ServerResponse::SetFailure
+                };
 
-        let mut index = HashMap::new();
+                let server_response = serde_json::to_string(&server_response)?;
+                let server_response = format!("{}\n", server_response);
 
-        let mut num_unnecessary_entries = 0;
+                stream.write(server_response.as_bytes())?;
+                Ok(())
+            }
+            Command::Remove { key } => {
+                let server_response = if let Ok(_) = self.engine.remove(key) {
+                    ServerResponse::RemoveSuccess
+                } else {
+                    ServerResponse::RemoveFailure
+                };
 
-        let log_reader = BufReader::new(log_file.try_clone()?);
-        let mut bytes_read = 0;
-        for line in log_reader.lines() {
-            let line = line?;
+                let server_response = serde_json::to_string(&server_response)?;
+                let server_response = format!("{}\n", server_response);
 
-            let cmd: Command = serde_json::from_str(&line)?;
-            let cmd_len = line.len() as u64;
-
-            match cmd {
-                Command::Set { key, value: _ } => {
-                    if index.contains_key(&key) {
-                        num_unnecessary_entries += 1;
-                    }
-
-                    index.insert(
-                        key,
-                        CommandPos {
-                            pos: bytes_read,
-                            len: cmd_len,
-                        },
-                    )
-                }
-                Command::Remove { key } => index.remove(&key),
-            };
-
-            bytes_read += cmd_len + 1; // because of the newline separating commands
-        }
-
-        Ok(Self {
-            log_writer: BufWriterWithPosition::new(log_file.try_clone()?, bytes_read),
-            log_reader: BufReader::new(log_file),
-            index,
-            num_unnecessary_entries,
-            path,
-        })
-    }
-
-    fn should_compact(&self) -> bool {
-        self.num_unnecessary_entries as f32 / self.index.len() as f32 > COMPACTION_THRESHOLD
-    }
-
-    fn compact(&mut self) -> Result<()> {
-        let mut new_log_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(self.path.join("kvs_temp.log"))?;
-
-        for (_, command_pos) in self.index.iter() {
-            let local_reader = &mut self.log_reader;
-
-            local_reader.seek(io::SeekFrom::Start(command_pos.pos))?; // offset reader's cursor to start of the desired command
-            let mut cmd_reader = local_reader.take(command_pos.len);
-
-            let mut command = String::new();
-            cmd_reader.read_to_string(&mut command)?;
-
-            if let command @ Command::Set { key: _, value: _ } = serde_json::from_str(&command)? {
-                // write to temp log file
-                serde_json::to_writer(&mut new_log_file, &command)?;
-                write!(&mut new_log_file, "\n")?;
-            } else {
-                panic!(
-                    "When compacting, index did of a key did not point to a SET command in the log"
-                )
+                stream.write_all(server_response.as_bytes())?;
+                Ok(())
             }
         }
-
-        new_log_file.flush()?;
-
-        // don't need the old log file now, rename to kvs.log thereby replacing the old log file
-        fs::rename(self.path.join("kvs_temp.log"), self.path.join("kvs.log"))?;
-
-        let mut new_store = Self::open(&self.path)?;
-
-        std::mem::swap(self, &mut new_store);
-
-        Ok(())
     }
 }
 
-/// Whether command worked successfully
-pub type Result<T> = std::result::Result<T, failure::Error>;
+/// the type of key value storage engine
+#[derive(Debug)]
+pub enum EngineType {
+    /// custom in house definition
+    Kvs,
 
-struct BufWriterWithPosition<T>
-where
-    T: Write + Read,
-{
-    writer: BufWriter<T>,
-    num_bytes_written: u64,
+    /// 3rd party KV storage engine
+    Sled,
 }
 
-impl<T> BufWriterWithPosition<T>
-where
-    T: Write + Read,
-{
-    fn new(w: T, num_bytes_written: u64) -> Self {
-        Self {
-            writer: BufWriter::new(w),
-            num_bytes_written,
+impl ToString for EngineType {
+    fn to_string(&self) -> String {
+        match self {
+            Self::Kvs => String::from("kvs"),
+            Self::Sled => String::from("sled"),
         }
     }
 }
 
-impl Drop for KvStore {
-    fn drop(&mut self) {
-        self.log_writer
-            .flush()
-            .expect("Failed flushing log_writer when dropping KvStore");
-    }
-}
-
-impl<T> Write for BufWriterWithPosition<T>
-where
-    T: Write + Read,
-{
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let bytes_written = self.writer.write(buf)?;
-        self.writer.flush()?;
-
-        self.num_bytes_written += bytes_written as u64;
-
-        Ok(bytes_written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
+impl FromStr for EngineType {
+    type Err = failure::Error;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "kvs" => Ok(Self::Kvs),
+            "sled" => Ok(Self::Sled),
+            _ => Err(format_err!("invalid engine type")),
+        }
     }
 }
