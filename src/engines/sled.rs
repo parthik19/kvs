@@ -4,14 +4,16 @@ use failure::format_err;
 use std::path::PathBuf;
 
 // sled storage stuff starts here
+/// thin wrapper around the sled db
 pub struct SledKvsEngine {
     inner: sled::Db,
 }
 
 impl SledKvsEngine {
-    pub fn open(path: PathBuf) -> Result<SledKvsEngine> {
+    /// create the sled db at some specified path
+    pub fn open(path: impl Into<PathBuf>) -> Result<SledKvsEngine> {
         Ok(Self {
-            inner: sled::open(path.join("sled_db.log"))?,
+            inner: sled::open(path.into().join("sled_db.log"))?,
         })
     }
 }

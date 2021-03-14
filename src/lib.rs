@@ -16,6 +16,7 @@ use std::{
 mod engines;
 
 pub use engines::kvs::KvStore;
+pub use engines::sled::SledKvsEngine;
 
 /// Whether command worked successfully
 pub type Result<T> = std::result::Result<T, failure::Error>;
@@ -181,7 +182,6 @@ impl KvsServer {
             }
         }
 
-        eprintln!("Didn't find any log files when searching for existing engine");
         Ok(None)
     }
 
